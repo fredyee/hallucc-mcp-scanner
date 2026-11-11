@@ -90,8 +90,7 @@ print(r.verdict)  # "injection"
 
 ## 规则来源与同步
 
-本仓库的规则层从 HallucC 内部代码库定期同步（`hccua/mcp_scan.py`、`hccua/inject.py`
-模式层、`compliance_checker.py`）。规则更新先经内部基准回归（含 51 条干净轨迹的
+本仓库的规则层从 HallucC 产品代码库定期同步。规则更新先经内部基准回归（含 51 条干净轨迹的
 零误报门槛）再同步到这里。
 
 ## License

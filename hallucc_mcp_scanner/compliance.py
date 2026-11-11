@@ -1,6 +1,6 @@
 """中文广告法违禁词/极限词合规检测（发布前体检场景）。
 
-设计约束（11 月计划 W1）：
+设计约束：
 - 纯正则、0 LLM、单次检测 <1ms（规则在 import 时预编译）
 - 词库来源：《广告法》条文明确列举 + 市场监管执法实践公开认定的极限词清单
 - 五类：absolute 绝对化用语 / medical_claim 医疗功效宣称 / false_promise 虚假承诺 /
@@ -268,10 +268,10 @@ def rule_count() -> dict[str, int]:
     return out
 
 
-# ─────────────────── /gao 端点与前端消费的字典契约 ───────────────────
+# ─────────────────── API 端点与前端消费的字典契约 ───────────────────
 
 def scan(text: str) -> dict:
-    """违禁词扫描：返回 {hits, total, by_category}（/gao 端点与前端 gao-manager 的契约）。
+    """违禁词扫描：返回 {hits, total, by_category}（API 端点与前端消费的契约）。
 
     hits 按文中出现顺序排列；同一 (word, category) 只报首次出现位置 + 累计次数。
     每条 hit 的 word/category_label/law/advice 是前端直接渲染的字段，

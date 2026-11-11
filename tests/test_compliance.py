@@ -2,15 +2,14 @@
 
 - 结构化 API：check_compliance/summarize/rule_count（rule_id/severity/上下文窗口）
 - 五类规则命中正确性 + 误报防护 + 性能约束（<1ms 级）
-- scan()/ai_label_check() 的 /gao 字典契约（前端 gao-manager 直接渲染）
-- /gao 端点 E2E：三清单 + 改好稿 + gao 命名空间持久化 + 删除级联
+- scan()/ai_label_check() 的字典契约（word/category_label/law/advice +
+  has_declaration/tips，供前端直接渲染）
 """
 import time
 
 from hallucc_mcp_scanner.compliance import (
     check_compliance, summarize, rule_count, scan, ai_label_check, _CATEGORY_NAMES,
 )
-import compliance_checker
 
 
 def _ids(hits):
@@ -168,7 +167,7 @@ class TestSummarizeAndGuards:
 
 
 class TestScan:
-    """scan() 的 /gao 字典契约（前端 gao-manager 渲染 word/category_label/law/advice）。"""
+    """scan() 字典契约（word/category_label/law/advice，供前端直接渲染）。"""
 
     def test_absolute_terms_hit(self):
         r = scan("我们是销量第一的品牌，全网最低价，效果最佳！")

@@ -7,7 +7,7 @@
 2. over_permission — tool 含 shell/exec/write 能力但无 scope 限制声明
 3. rug_pull        — 首次扫描落基线，复扫 diff 告警（工具名/描述/schema hash 变化）
 4. supply_chain    — server 包名/命令命中已知恶意清单
-5. plaintext_secret — env/args 里的明文密钥（B1 体检升级：占位符不报，真凭据才报）
+5. plaintext_secret — env/args 里的明文密钥（占位符不报，真凭据才报）
 
 并输出 per-server 权限清单（inventory）：把「这个 server 能干什么」翻成人话——
 shell 执行 / 文件读写 / 网络外发 / 持有凭据 / 触及敏感路径。清单是报告主体，
