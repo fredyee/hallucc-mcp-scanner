@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hallucc-mcp-scanner"
+version = "0.1.0"
+description = "MCP config security scanner + Chinese ad-law compliance wordlists (pure rules, zero LLM)"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [{ name = "fredyee", email = "fredyee2009@gmail.com" }]
+keywords = ["mcp", "mcp-security", "prompt-injection", "agent-security", "广告法", "违禁词"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Security",
+]
+# 无硬依赖：PyYAML 仅用于 YAML 配置的兜底解析，不装时 JSON 配置照常工作
+dependencies = []
+
+[project.optional-dependencies]
+yaml = ["PyYAML>=6.0"]
+dev = ["pytest>=8.0", "PyYAML>=6.0"]
+
+[project.scripts]
+hallucc-mcp-scan = "hallucc_mcp_scanner.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/fredyee/hallucc-mcp-scanner"
+"Online scanner" = "https://aihcc.cloud/mcp-scanner"
+
+[tool.setuptools.packages.find]
+include = ["hallucc_mcp_scanner*"]

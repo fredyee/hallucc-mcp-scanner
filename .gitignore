@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+.pytest_cache/
+
+# 扫描基线文件（含本地配置指纹，属本地状态）
+*.baseline.json
