@@ -12,7 +12,9 @@ from hallucc_mcp_scanner.scanner import scan_config
 
 
 def _cfg(env=None, args=None, tools=None, command="npx"):
-    server = {"command": command, "args": args or ["-y", "some-mcp"]}
+    # 默认钉版：未固定版本本身是 supply_chain 中危 finding（2026-11-20 规则补漏），
+    # 不钉会让每个用例都多一条与测点无关的 finding
+    server = {"command": command, "args": args or ["-y", "some-mcp@1.0.0"]}
     if env is not None:
         server["env"] = env
     if tools is not None:
@@ -85,6 +87,47 @@ def test_summary_counts_secrets():
     assert r.summary["risk_level"] == "high"
 
 
+# ---------- 连接串内嵌密码（2026-11-20 规则补漏：DATABASE_URL 形态曾整体漏报） ----------
+
+def test_secret_uri_embedded_password_env():
+    """key 名不含 password/secret（DATABASE_URL）也能靠连接串 userinfo 形态命中。"""
+    r = scan_config(_cfg(env={
+        "DATABASE_URL": "postgres://readonly:Passw0rd!2025@192.168.1.20:5432/crm"}))
+    hits = _secrets(r)
+    assert len(hits) == 1 and hits[0].severity == "high"
+    assert "连接串内嵌" in hits[0].detail
+    assert "Passw0rd" not in hits[0].raw  # 脱敏：密码绝不回显
+
+
+def test_secret_uri_placeholder_password_not_flagged():
+    """密码段是占位符/无密码段/普通 URL 都不报。"""
+    r = scan_config(_cfg(env={
+        "DATABASE_URL": "postgres://u:${PGPASSWORD}@h/db",
+        "MYSQL_URL": "mysql://root:<password>@h/db",
+        # key 名不能含 password/secret 等词——那会走「key 名像凭据+真实值」
+        # 通用通道命中（既有行为，与本规则无关）
+        "PG_DSN": "postgres://user@host/db",
+        "PLAIN_URL": "https://api.example.com/v1",
+        "PROXY": "http://proxy:3128",
+    }))
+    assert _secrets(r) == []
+
+
+def test_secret_uri_in_args():
+    """args 里的连接串密码同样命中且只掩密码段。"""
+    r = scan_config(_cfg(args=["-y", "some-mcp@1.0.0", "--db",
+                               "postgres://u:hunter2@db.internal:5432/app"]))
+    hits = _secrets(r)
+    assert len(hits) == 1
+    assert "hunter2" not in hits[0].raw and "***" in hits[0].raw
+
+
+def test_secret_uri_redis_empty_user():
+    """redis://:password@host（无用户名）形态也命中。"""
+    r = scan_config(_cfg(env={"REDIS_URL": "redis://:s3cretValue@cache.internal/0"}))
+    assert len(_secrets(r)) == 1
+
+
 # ---------- 权限清单 ----------
 
 def test_inventory_shell_and_credentials():
@@ -108,7 +151,31 @@ def test_inventory_tool_descriptions():
 
 
 def test_inventory_sensitive_path():
-    r = scan_config(_cfg(args=["-y", "fs-mcp", "--root", "~/.ssh"]))
+    r = scan_config(_cfg(args=["-y", "fs-mcp@1.0.0", "--root", "~/.ssh"]))
+    caps = {c["id"] for c in r.inventory[0]["capabilities"]}
+    assert "sensitive_path" in caps
+
+
+def test_inventory_known_package_caps():
+    """已知包名 → 能力映射：filesystem 包不需要工具描述即可确认读写能力。"""
+    r = scan_config(_cfg(args=["-y", "@modelcontextprotocol/server-filesystem@2025.8.21",
+                               "/data"]))
+    caps = {c["id"] for c in r.inventory[0]["capabilities"]}
+    assert {"file_read", "file_write"} <= caps
+
+
+def test_inventory_database_and_uri_credentials():
+    """postgres 包 → database 能力；连接串内嵌密码 → credentials 能力。"""
+    r = scan_config(_cfg(args=["-y", "mcp-server-postgres@0.5.0"],
+                         env={"DATABASE_URL": "postgres://u:p@h/db"}))
+    caps = {c["id"] for c in r.inventory[0]["capabilities"]}
+    assert "database" in caps
+    assert "credentials" in caps
+
+
+def test_inventory_broad_path_cap():
+    """授权根目录计入 sensitive_path 能力。"""
+    r = scan_config(_cfg(args=["-y", "fs-mcp@1.0.0", "/"]))
     caps = {c["id"] for c in r.inventory[0]["capabilities"]}
     assert "sensitive_path" in caps
 

