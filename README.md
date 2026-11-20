@@ -14,13 +14,15 @@ MCP 配置安全扫描 + 中文广告法合规词库。**纯规则、零 LLM、�
 
 | 类别 | 说明 |
 |---|---|
-| `tool_poisoning` | 工具描述里内嵌 prompt injection 指令（中英双语模式库 + 零宽字符/Base64 负载检测） |
-| `over_permission` | 工具声明 shell/写文件/网络等敏感能力，却无 readonly/sandbox 等权限边界声明；启动参数把整个根目录/家目录（`/`、`~`、`C:\` 等）授出也算过权，高危 |
-| `rug_pull` | 首次扫描落基线，复扫 diff：工具描述/Schema 变化、server 启动命令被换（钉版本号投毒） |
+| `tool_poisoning` | 工具描述与 **inputSchema 参数描述**里内嵌 prompt injection 指令（中英双语模式库 + 零宽字符/Base64 负载检测；含中文「自动抄送/回传到外部邮箱」静默外发模式） |
+| `over_permission` | 工具声明 shell/写文件/网络等敏感能力，却无 readonly/sandbox 等权限边界声明（中英双语识别：英文走词边界防子串误报，中文只收「任意路径/无目录限制」等确证词组防裸词误报；`no whitelist`/`无白名单` 这类否定表述**不算**限制声明）；启动参数把整个根目录/家目录（`/`、`~`、`C:\` 等）授出也算过权，高危 |
+| `rug_pull` | 首次扫描落基线，复扫 diff：工具描述/Schema 变化、server 启动命令被换（钉版本号投毒）；启动参数按**顺序敏感**比较（npx/uvx 靠位置解析包名） |
 | `supply_chain` | server 包名/命令命中已知恶意清单或危险命令模式（`curl \| bash`、`rm -rf`、提权等）；`npx`/`uvx`/`bunx` 启动未钉 semver 版本（`@latest` 等可变 tag 也算）每次启动解析最新包，是 rug pull 入口，中危 |
 | `plaintext_secret` | env/args 里的明文密钥（OpenAI/AWS/GitHub/Google/Slack/HF/JWT/PEM/SendGrid 前缀 + 连接串内嵌密码 `scheme://user:password@host`（`DATABASE_URL` 跑不掉）+「key 名像凭据+真实值」通用通道；占位符 `${VAR}`/`<your-key>` 不报） |
 
 另外输出 **per-server 权限清单**：把「这个 server 能干什么」翻成人话（可执行任意命令 / 可读写文件 / 可联网外发 / 持有凭据 / 触及敏感目录 / 可访问数据库）——零命中也展示，零命中 ≠ 零权限。
+
+**配置格式兼容**：`mcpServers`（mcp.json / claude_desktop_config.json）、`servers` 与 `mcp.servers`（VS Code settings.json）、直接传 `tools` 列表、JSON 与 YAML 均可；提取不到任何 server/tool 时返回 `parse_error` 提示而不是「零风险」绿标。
 
 **密钥脱敏红线**：命中的凭据只显示头 4 位 + 尾 2 位（如 `sk-a···89`），完整值绝不回显、不上传、不落库。
 
