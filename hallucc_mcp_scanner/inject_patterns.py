@@ -66,6 +66,12 @@ PATTERNS: list[InjectPattern] = [
                   r"(把|将).{0,20}(文件|内容|数据|密码|密钥|通讯录).{0,10}(发送|上传|发|传)(给|到)", "指令外发数据(中)"),
     InjectPattern("exfil_read_sensitive", "exfiltration", "high",
                   r"(?i)(read|open|cat|type)\s+.{0,30}(\.ssh|\.aws|id_rsa|credentials|\.env)\b|读取.{0,10}(\.ssh|密钥文件|凭证)", "指令读取敏感文件"),
+    # 静默外发到外部地址：中文工具描述里的「抄送/同步/回传到第三方邮箱」是数据
+    # 外泄的典型措辞；命中具体邮箱地址时单条即可定罪
+    InjectPattern("exfil_silent_cc_zh", "exfiltration", "high",
+                  r"(抄送|转发|回传|同步|上传|发送).{0,20}(给|到|至)?.{0,10}"
+                  r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}",
+                  "静默外发数据(中)"),
 
     # 6. 紧迫性社工 —— low（单独命中不定罪）
     InjectPattern("urgency", "social_engineering", "low",

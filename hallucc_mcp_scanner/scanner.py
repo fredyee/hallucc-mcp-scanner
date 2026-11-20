@@ -2,11 +2,15 @@
 
 竞品对标：Invariant Labs MCP-scan（2025 年被 Snyk 收购）。
 
-检测四类（纯规则、0 LLM）：
-1. tool_poisoning  — tool description 内嵌指令模式（模式库见 inject_patterns.py）
-2. over_permission — tool 含 shell/exec/write 能力但无 scope 限制声明；
+检测五类（纯规则、0 LLM）：
+1. tool_poisoning  — tool description / inputSchema 参数描述内嵌指令模式
+   （模式库见 inject_patterns.py；中英文覆盖，含「自动抄送到外部邮箱」静默外发）
+2. over_permission — tool 含 shell/exec/write 等能力但无 scope 限制声明
+   （中英双语识别：英文走词边界防子串误报，中文只收「无边界授权」确证词组防裸词误报；
+   「no whitelist / 无白名单」这类否定表述不算限制声明）；
    server 启动参数把整个根目录/家目录授出（broad_scope）也算过权，高危
-3. rug_pull        — 首次扫描落基线，复扫 diff 告警（工具名/描述/schema hash 变化）
+3. rug_pull        — 首次扫描落基线，复扫 diff 告警（工具名/描述/schema hash 变化；
+   server 启动参数按顺序敏感比较——npx/uvx 靠位置解析包名）
 4. supply_chain    — server 包名/命令命中已知恶意清单；npx/uvx 未钉 semver 版本
    （@latest 等可变 tag 也算未固定）是 rug pull 入口，中危
 5. plaintext_secret — env/args 里的明文密钥（占位符不报，真凭据才报；
@@ -16,10 +20,11 @@
 shell 执行 / 文件读写 / 网络外发 / 持有凭据 / 触及敏感路径 / 数据库访问。清单是报告主体，
 findings 是需要修的问题；零命中时清单依然展示（零命中 ≠ 零权限）。
 
-MCP 配置格式兼容 mcp.json / claude_desktop_config.json：
-    {"mcpServers": {"name": {"command": "...", "args": [...], "env": {...}}}}
+MCP 配置格式兼容 mcp.json / claude_desktop_config.json / VS Code settings.json：
+    {"mcpServers": {...}} / {"servers": {...}} / {"mcp": {"servers": {...}}}
 也支持直接传工具列表：
     {"tools": [{"name": "...", "description": "...", "inputSchema": {...}}]}
+提取不到任何 server/tool 时返回 parse_error 提示（空配置不该给「零风险」绿标）。
 """
 from __future__ import annotations
 
@@ -186,24 +191,61 @@ def _unpinned_package(command: str, args: list) -> str | None:
 
 # 危险能力关键词：tool 能做这些事时需要 scope 限制声明。
 # 刻意不含 file/path/directory/folder 等中性词（搜索文件 ≠ 写文件）。
-_DANGEROUS_CAPABILITY_KEYWORDS = [
-    "execute", "exec", "shell", "command", "run", "spawn", "subprocess",
-    "write", "delete", "remove", "create", "modify", "edit",
-    "install", "upgrade", "update", "configure", "setup",
-    "password", "credential", "token", "secret", "key",
-    "network", "http", "api", "request", "fetch",
-    "system", "os", "process",
-    "chmod", "chown", "sudo", "curl", "wget",
-]
+# 英文走词边界 regex（子串匹配时代把 "closES"/"coST"/"hOSpital" 全误报），
+# 中文没有词边界概念，直接子串匹配。
+# 中英双轨：中文 tool 描述在国内是常态，只认英文关键词 = 整类漏判。
+_DANGEROUS_CAPABILITY_RE = re.compile(
+    r"\b(execute|exec(?:ute)?|shell|commands?|run|spawn|subprocess"
+    r"|write|delete|remove|create|modify|edit"
+    r"|install|upgrade|update|configure|setup"
+    r"|passwords?|credentials?|tokens?|secrets?|keys?"
+    r"|network|https?|apis?|requests?|fetch"
+    r"|system|os|process"
+    r"|chmod|chown|sudo|curl|wget)\b",
+    re.IGNORECASE)
 
-# scope 限制声明关键词：tool 描述含这些词时视为已声明权限边界
-_SCOPE_LIMIT_KEYWORDS = [
-    "readonly", "read-only", "read only", "limited", "restricted",
-    "scoped", "sandbox", "sandboxed", "isolated", "safe",
-    "whitelist", "allowlist", "blocked", "denied",
-    "confirmation", "confirm", "approval", "approve",
-    "user", "explicit", "manual",
-]
+# 中文危险能力：必须是复合词组，不能收裸字——「执行/读取/命令」单字在几乎所有
+# 中文工具描述里都出现（「执行 SQL 查询」「读取指定文件」），裸词一开就是误报风暴
+# （真实配置 28 条中危的教训）。只收「无边界授权」的确证措辞：
+_DANGEROUS_ZH_RE = re.compile(
+    # 任意 X：无边界授权的经典措辞
+    r"任意\s*(?:路径|文件|目录|命令|网址|网站|shell|脚本|内容|位置|机器|设备|网络|端口|主机)"
+    # 执行/运行 …命令/脚本/shell（允许中间夹「任意」等短修饰）
+    r"|(?:执行|运行).{0,6}(?:命令|脚本|程序|shell)"
+    # 无（命令）白名单 / 无目录限制：自曝无边界
+    r"|无.{0,2}(?:命令|调用)?.{0,2}白名单"
+    r"|无(?:目录|路径|范围|访问|权限).{0,2}限制"
+    # 删除/清空/格式化 …文件/数据（可夹短修饰）
+    r"|(?:删除|移除|清空|格式化).{0,6}(?:文件|数据|目录|数据库|磁盘)"
+    # 写入/修改 任意文件/配置；或动系统文件/注册表/环境变量
+    r"|(?:写入|修改|覆盖|篡改)(?:.{0,4}(?:任意|所有|一切).{0,4}(?:文件|目录|配置|数据)"
+    r"|.{0,4}(?:系统文件|注册表|环境变量))"
+    # 读取 任意/本机/他人文件；或读取密码/密钥/凭据
+    r"|读取(?:.{0,4}(?:任意|所有|一切|本机|其他|他人).{0,4}(?:文件|目录|路径)"
+    r"|.{0,6}(?:密码|密钥|凭据|私钥|令牌))")
+
+# scope 限制声明：tool 描述含这些词时视为已声明权限边界。
+# 子串匹配的前提是否定感知——"no whitelist"/"unrestricted"/"无白名单" 里的
+# 白名单/受限是**反着说的**，当限制声明会漏判最嚣张的过权描述。
+_SCOPE_LIMIT_RE = re.compile(
+    r"\b(readonly|read-only|read only|limited|restricted|scope[sd]?|sandbox(?:ed)?"
+    r"|isolated|safe|whitelist(?:ed)?|allowlist(?:ed)?|blocked|denied"
+    r"|confirmation|confirm(?:ed)?|approv(?:al|ed)|explicit|manual)\b"
+    r"|只读|白名单|沙箱|仅限|限于|限定|需确认|需审批|人工确认|人工审批",
+    re.IGNORECASE)
+# 跟在 scope 词前面的否定词（中/英）。间隔容忍短串（"no longer limited"）。
+_SCOPE_NEGATION_RE = re.compile(
+    r"(?:\b(?:no|not|never|un-|without|free from)\b[^。.!？?，；;:]{0,20})"
+    r"|(?:无|不受|没有|不限|非)[^。.!？?，；;:]{0,8}")
+
+
+def _has_scope_limit(desc: str) -> bool:
+    """描述里存在**未被否定的** scope 限制声明。"""
+    for m in _SCOPE_LIMIT_RE.finditer(desc):
+        # 回看 match 前 ≤30 字符有无否定前缀（中英否定词后面能隔短修饰语）
+        if not _SCOPE_NEGATION_RE.search(desc[max(0, m.start() - 30):m.start()]):
+            return True
+    return False
 
 
 # ---------- 明文密钥检测（B1） ----------
@@ -371,7 +413,9 @@ def _build_inventory(servers: dict[str, Any], all_tools: list[dict]) -> list[dic
         haystack = f"{cmd} {args} {tool_text}".lower()
 
         caps: list[dict] = []
-        cmd_base = cmd.rsplit("/", 1)[-1].lower()
+        cmd_base = cmd.rsplit("/", 1)[-1].rsplit("\\", 1)[-1].lower()
+        # Windows 可执行后缀不影响判定（python.exe 也是解释器）
+        cmd_base = cmd_base.removesuffix(".exe").removesuffix(".cmd").removesuffix(".bat")
         if cmd_base in _INTERPRETER_COMMANDS or any(
                 kw in haystack for kw in _CAPABILITY_KEYWORDS["shell_exec"][1]):
             caps.append({"id": "shell_exec", "label": "可执行任意命令",
@@ -417,7 +461,7 @@ def _compute_config_hash(servers: dict[str, Any], tools: list[dict]) -> str:
     parts = []
     for name, cfg in sorted(servers.items()):
         cmd = cfg.get("command", "")
-        args = json.dumps(sorted(cfg.get("args", [])), ensure_ascii=False)
+        args = json.dumps(cfg.get("args", []), ensure_ascii=False)  # 顺序敏感：勿 sorted
         parts.append(f"server:{name}:{cmd}:{args}")
     for tool in sorted(tools, key=lambda t: t.get("name", "")):
         name = tool.get("name", "")
@@ -489,7 +533,7 @@ def _diff_baseline(current_tools: list[dict], current_servers: dict[str, Any],
             changes.append({"desc": f"Server 启动命令变化: {name}"
                                     f"（{base.get('command', '')} → {cur_cmd}）",
                             "severity": "high"})
-        elif sorted(cur_args) != sorted(base_args):
+        elif cur_args != base_args:  # 顺序敏感：npx/uvx 靠参数位置解析包名
             old = " ".join(base_args)[:80]
             new = " ".join(cur_args)[:80]
             changes.append({"desc": f"Server 启动参数变化: {name}（{old} → {new}）",
@@ -546,8 +590,9 @@ def _parse_config_text(text: str) -> Any:
 def extract_parts(config: dict | str) -> tuple[dict[str, Any], list[dict]] | None:
     """从 MCP 配置提取 (servers, tools)。解析失败返回 None。
 
-    兼容三种输入形态：
+    兼容五种输入形态：
     - {"mcpServers": {name: {command, args, env, tools?}}}   —— mcp.json / claude_desktop_config.json
+    - {"servers": {...}} / {"mcp": {"servers": {...}}}      —— VS Code / 其他宿主方言
     - {"tools": [...]}                                      —— 直接给工具清单
     - [{...}, {...}] 或 {"command": ...}                    —— 纯 server 列表 / 单个 server
 
@@ -561,6 +606,13 @@ def extract_parts(config: dict | str) -> tuple[dict[str, Any], list[dict]] | Non
     servers: dict[str, Any] = {}
     if isinstance(config, dict):
         servers = config.get("mcpServers", {}) or {}
+        if not servers:
+            # VS Code settings.json 用 "servers"；部分宿主嵌在 "mcp" 下
+            cand = config.get("servers") or {}
+            if not cand and isinstance(config.get("mcp"), dict):
+                cand = config["mcp"].get("servers", {}) or {}
+            if isinstance(cand, dict):
+                servers = cand
     if not servers and not (isinstance(config, dict) and "tools" in config):
         if isinstance(config, list):
             servers = {str(i): item for i, item in enumerate(config) if isinstance(item, dict)}
@@ -600,6 +652,14 @@ def scan_config(config: dict | str, baseline_path: Path | None = None,
     report = ScanReport()
     report.tool_count = len(all_tools)
     report.server_count = len(servers)
+
+    # 0. 空配置显式提示：提取不到任何 server/tool 却给「零风险」绿标，是误导
+    if not servers and not all_tools:
+        report.add(Finding(
+            server="(config)", severity="low", category="parse_error",
+            detail="未识别到任何 MCP server 或工具：配置可能为空、或使用了本扫描器"
+                   "不支持的格式（已支持 mcpServers / servers / mcp.servers / tools 列表）"))
+        return report
 
     # 1. supply_chain: server 包名/命令恶意检测
     for name, cfg in servers.items():
@@ -644,13 +704,29 @@ def scan_config(config: dict | str, baseline_path: Path | None = None,
                        "建议收窄到具体工作目录",
                 raw=" ".join(str(a) for a in cfg.get("args", []))[:300]))
 
-    # 2. tool_poisoning: tool description 内嵌注入指令
+    # 2. tool_poisoning: tool description 内嵌注入指令（含 inputSchema 参数描述——
+    # 后者是公开的投毒面：description 干净，指令藏在参数描述里诱导 agent）
+    def _schema_descriptions(node: Any, out: list[str]) -> None:
+        if isinstance(node, dict):
+            for k, v in node.items():
+                if k == "description" and isinstance(v, str) and v:
+                    out.append(v)
+                elif isinstance(v, (dict, list)):
+                    _schema_descriptions(v, out)
+        elif isinstance(node, list):
+            for item in node:
+                _schema_descriptions(item, out)
+
     for tool in all_tools:
         name = tool.get("name", "unknown")
         desc = tool.get("description", "")
-        if not desc:
+        extra: list[str] = []
+        _schema_descriptions(tool.get("inputSchema", {}), extra)
+        texts = [desc] if desc else []
+        texts += extra
+        if not texts:
             continue
-        inj_report = scan_screen_text(desc)
+        inj_report = scan_screen_text("\n".join(texts))
         if inj_report.verdict == "injection":
             for m in inj_report.matches:
                 report.add(Finding(
@@ -670,9 +746,9 @@ def scan_config(config: dict | str, baseline_path: Path | None = None,
         desc = tool.get("description", "").lower()
         if not desc:
             continue
-        has_dangerous = any(kw in desc for kw in _DANGEROUS_CAPABILITY_KEYWORDS)
-        has_scope_limit = any(kw in desc for kw in _SCOPE_LIMIT_KEYWORDS)
-        if has_dangerous and not has_scope_limit:
+        has_dangerous = (_DANGEROUS_CAPABILITY_RE.search(desc)
+                         or _DANGEROUS_ZH_RE.search(desc))
+        if has_dangerous and not _has_scope_limit(desc):
             report.add(Finding(
                 server=name, severity="medium", category="over_permission",
                 detail="工具描述含敏感能力但无权限限制声明",

@@ -22,7 +22,7 @@ from .compliance import (
     ai_label_check,
 )
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = [
     "InjectPattern", "InjectMatch", "InjectionReport", "PATTERNS", "scan_screen_text",
